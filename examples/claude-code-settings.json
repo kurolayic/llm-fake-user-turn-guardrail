@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/.venv/bin/fake-user-turn-hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
