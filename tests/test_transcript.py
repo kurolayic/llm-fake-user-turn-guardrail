@@ -41,6 +41,27 @@ class TranscriptTests(unittest.TestCase):
         analysis = analyze_events(events)
         self.assertEqual(analysis.false_attributions, ("is it fixed?",))
 
+    def test_generic_tag_envelope_cannot_prove_user_said_quote(self):
+        events = [
+            user("<task-notification>is it fixed?</task-notification>"),
+            assistant({"type": "text", "text": 'The user just asked “is it fixed?”'}),
+        ]
+        analysis = analyze_events(events)
+        self.assertEqual(analysis.false_attributions, ("is it fixed?",))
+
+    def test_thinking_log_is_not_a_structural_visible_text_finding(self):
+        analysis = analyze_events([
+            user("Inspect the service."),
+            assistant(
+                {
+                    "type": "thinking",
+                    "thinking": "Reading logs:\n[2026-06-11 00:28:24] worker started",
+                },
+                {"type": "text", "text": "The service is healthy."},
+            ),
+        ])
+        self.assertIsNone(analysis.structural)
+
     def test_post_hoc_denial_does_not_wash_previous_assistant_event(self):
         events = [
             user("Please inspect the service."),
@@ -53,6 +74,10 @@ class TranscriptTests(unittest.TestCase):
     def test_real_user_filter(self):
         self.assertTrue(is_real_user_event(user("hello")))
         self.assertFalse(is_real_user_event(user("<context>hello</context>")))
+        self.assertFalse(
+            is_real_user_event(user("<task-notification>hello</task-notification>"))
+        )
+        self.assertFalse(is_real_user_event(user("<context source=\"test\" />")))
         self.assertFalse(is_real_user_event(user("[heartbeat] hello")))
 
     def test_tail_loader_skips_partial_first_line(self):

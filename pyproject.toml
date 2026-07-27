@@ -1,19 +1,19 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-fake-user-turn-guardrail"
-version = "0.1.0"
+version = "0.2.0"
 description = "A deterministic two-layer guardrail for fabricated user turns and false user-attribution in LLM transcripts."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "kurolayic"}]
 keywords = ["llm", "guardrail", "hallucination", "claude-code", "transcript"]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: Software Development :: Libraries :: Python Modules",

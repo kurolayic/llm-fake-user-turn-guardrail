@@ -9,15 +9,26 @@ from typing import Iterable
 
 ROLE_MARKERS = frozenset({"user", "assistant", "human:", "h:", "a:"})
 FAKE_USER_TIMESTAMP = re.compile(
-    r"^(?:(?:user|univers(?:e)?)\s*)?"
+    r"^(?:(?P<prefix>user|univers(?:e)?)\s*)?"
     r"\[20\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]",
     re.IGNORECASE,
 )
 INTERRUPTION_MARKER = re.compile(
-    r"^(?:user|assistant|human:?)?\s*mid-stream interruption",
+    r"^(?:(?:user|assistant|human:?)\s+)?mid-stream interruption",
     re.IGNORECASE,
 )
-QUOTE_PAIRS = (("\"", "\""), ("'", "'"), ("“", "”"), ("‘", "’"), ("「", "」"), ("『", "』"))
+FENCE_MARKER = re.compile(r"^(?P<fence>`{3,}|~{3,})")
+CLAUSE_BOUNDARY = re.compile(r"[.!?。！？;；,，\n]")
+STRUCTURAL_MAX_TAIL_LINES = 40
+STRUCTURAL_MAX_TAIL_CHARS = 4_000
+QUOTE_PAIRS = (
+    ("\"", "\""),
+    ("'", "'"),
+    ("“", "”"),
+    ("‘", "’"),
+    ("「", "」"),
+    ("『", "』"),
+)
 HYPOTHETICAL_TERMS = (
     "if", "assuming", "suppose", "what if",
     "如果", "要是", "假如", "假设", "万一", "倘若",
@@ -57,29 +68,62 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
-def _structural_marker(value: str) -> str | None:
+def _structural_marker(value: str, *, allow_bare_timestamp: bool = False) -> str | None:
     if value.casefold() in ROLE_MARKERS:
         return "role-marker"
-    if FAKE_USER_TIMESTAMP.match(value):
+    timestamp = FAKE_USER_TIMESTAMP.match(value)
+    if timestamp and (timestamp.group("prefix") or allow_bare_timestamp):
         return "timestamp"
     if INTERRUPTION_MARKER.match(value):
         return "interruption-marker"
     return None
 
 
-def split_fake_user_tail(text: str) -> tuple[str, StructuralFinding | None]:
+def split_fake_user_tail(
+    text: str,
+    *,
+    max_tail_lines: int = STRUCTURAL_MAX_TAIL_LINES,
+    max_tail_chars: int = STRUCTURAL_MAX_TAIL_CHARS,
+) -> tuple[str, StructuralFinding | None]:
     """Return safe prefix and a structural finding, if one exists.
 
-    Matching is deliberately limited to the start of a line or an exact role
-    line so prose discussing these markers remains untouched.
+    Matching is deliberately limited to a bounded tail outside fenced code.
+    Bare timestamps require a preceding role marker; corrupted role prefixes
+    such as ``univers[...]`` remain independently detectable.
     """
 
     lines = text.split("\n")
+    first_candidate = max(0, len(lines) - max(1, max_tail_lines))
+    suffix_chars = [0] * (len(lines) + 1)
+    for index in range(len(lines) - 1, -1, -1):
+        separator = 1 if index < len(lines) - 1 else 0
+        suffix_chars[index] = len(lines[index]) + separator + suffix_chars[index + 1]
+
+    fence_character: str | None = None
+    previous_role_marker = False
     for index, line in enumerate(lines):
         value = line.strip()
         if not value:
             continue
-        marker = _structural_marker(value)
+
+        fence = FENCE_MARKER.match(value)
+        if fence:
+            character = fence.group("fence")[0]
+            if fence_character is None:
+                fence_character = character
+            elif fence_character == character:
+                fence_character = None
+            previous_role_marker = False
+            continue
+        if fence_character is not None:
+            continue
+
+        in_tail = index >= first_candidate and suffix_chars[index] <= max(1, max_tail_chars)
+        marker = (
+            _structural_marker(value, allow_bare_timestamp=previous_role_marker)
+            if in_tail
+            else None
+        )
         if marker:
             return (
                 "\n".join(lines[:index]).rstrip(),
@@ -89,6 +133,7 @@ def split_fake_user_tail(text: str) -> tuple[str, StructuralFinding | None]:
                     tail="\n".join(lines[index:]),
                 ),
             )
+        previous_role_marker = value.casefold() in ROLE_MARKERS
     return text, None
 
 
@@ -112,38 +157,105 @@ def _quoted_spans(text: str, max_chars: int) -> list[tuple[int, str]]:
     return sorted(set(spans), key=lambda item: item[0])
 
 
-def _term_position(text: str, term: str) -> int | None:
+def _term_positions(text: str, term: str) -> list[int]:
     folded_term = term.casefold()
     if folded_term.isascii():
-        match = re.search(
-            r"(?<!\w)" + re.escape(folded_term) + r"(?!\w)",
-            text,
-        )
-        return match.start() if match else None
-    position = text.find(folded_term)
-    return position if position >= 0 else None
+        return [
+            match.start()
+            for match in re.finditer(
+                r"(?<!\w)" + re.escape(folded_term) + r"(?!\w)",
+                text,
+            )
+        ]
+
+    positions: list[int] = []
+    start = 0
+    while True:
+        position = text.find(folded_term, start)
+        if position < 0:
+            return positions
+        positions.append(position)
+        start = position + 1
 
 
 def _first_position(text: str, terms: Iterable[str]) -> int | None:
-    positions = [_term_position(text, term) for term in terms]
-    positions = [position for position in positions if position is not None]
+    positions = [
+        position
+        for term in terms
+        for position in _term_positions(text, term)
+    ]
     return min(positions) if positions else None
 
 
+def _attribution_clause(prefix: str) -> str:
+    return CLAUSE_BOUNDARY.split(prefix)[-1]
+
+
+def _is_cjk_character(value: str) -> bool:
+    return bool(value) and "\u3400" <= value <= "\u9fff"
+
+
+def _verb_positions_at_end(
+    text: str,
+    terms: Iterable[str],
+    *,
+    allowed_predecessor_ends: set[int],
+) -> list[int]:
+    positions: list[int] = []
+    for term in terms:
+        for position in _term_positions(text, term):
+            if (
+                len(term) == 1
+                and position > 0
+                and _is_cjk_character(term)
+                and _is_cjk_character(text[position - 1])
+                and position not in allowed_predecessor_ends
+            ):
+                continue
+            suffix = text[position + len(term):]
+            if re.fullmatch(r"(?:了|过|道)?\s*(?::|：)?\s*", suffix):
+                positions.append(position)
+    return positions
+
+
 def _is_explicit_near_attribution(prefix: str, config: AttributionConfig) -> bool:
-    folded = prefix.casefold()
-    subject = _first_position(folded, config.subjects)
-    near = _first_position(folded, config.near_terms)
-    verb = _first_position(folded, config.speech_verbs)
-    if subject is None or near is None or verb is None:
-        return False
-    return (subject <= near <= verb) or (near <= subject <= verb)
+    folded = _attribution_clause(prefix).casefold()
+    near_spans = [
+        (position, position + len(term))
+        for term in config.near_terms
+        for position in _term_positions(folded, term)
+    ]
+    near_ends = {end for _, end in near_spans}
+    subject_spans = [
+        (position, position + len(term))
+        for term in config.subjects
+        for position in _term_positions(folded, term)
+        if not (
+            len(term) == 1
+            and position > 0
+            and _is_cjk_character(term)
+            and _is_cjk_character(folded[position - 1])
+            and position not in near_ends
+        )
+    ]
+    allowed_predecessor_ends = near_ends | {end for _, end in subject_spans}
+    verbs = _verb_positions_at_end(
+        folded,
+        config.speech_verbs,
+        allowed_predecessor_ends=allowed_predecessor_ends,
+    )
+    return any(
+        ((subject <= near <= verb) or (near <= subject <= verb))
+        and verb - min(subject, near) <= 48
+        for subject, _ in subject_spans
+        for near, _ in near_spans
+        for verb in verbs
+    )
 
 
 def _is_hypothetical(prefix: str) -> bool:
-    folded = prefix.casefold().rstrip()
-    sentence = re.split(r"[.!?。！？\n]", folded)[-1]
-    return _first_position(sentence, HYPOTHETICAL_TERMS) is not None
+    folded = _attribution_clause(prefix).casefold().rstrip()
+    return _first_position(folded, HYPOTHETICAL_TERMS) is not None
 
 
 def find_false_attributions(

@@ -14,7 +14,7 @@ class StructuralDetectorTests(unittest.TestCase):
         self.assertEqual(finding.marker, "role-marker")
 
     def test_timestamp_and_corrupted_user_prefix_cut_tail(self):
-        for prefix in ("", "user", "univers", "universe"):
+        for prefix in ("user", "univers", "universe"):
             with self.subTest(prefix=prefix):
                 safe, finding = split_fake_user_tail(
                     f"Safe answer\n{prefix}[2026-07-16 09:44:02] fabricated"
@@ -22,10 +22,33 @@ class StructuralDetectorTests(unittest.TestCase):
                 self.assertEqual(safe, "Safe answer")
                 self.assertEqual(finding.marker, "timestamp")
 
+    def test_bare_timestamp_log_is_not_cut(self):
+        text = "Service log:\n[2026-06-11 00:28:24] worker started\nHealthy."
+        self.assertEqual(split_fake_user_tail(text), (text, None))
+
+    def test_marker_inside_fenced_example_is_not_cut(self):
+        text = (
+            "Here is a transcript example:\n"
+            "```text\n"
+            "user\n"
+            "[2026-06-11 00:28:24] hello\n"
+            "```\n"
+            "End."
+        )
+        self.assertEqual(split_fake_user_tail(text), (text, None))
+
+    def test_marker_outside_bounded_tail_is_not_cut(self):
+        text = "user\nfabricated\n" + "\n".join(f"line {index}" for index in range(50))
+        self.assertEqual(split_fake_user_tail(text), (text, None))
+
     def test_mid_stream_marker_cuts_tail(self):
         safe, finding = split_fake_user_tail("Safe\nmid-stream interruption user payload")
         self.assertEqual(safe, "Safe")
         self.assertEqual(finding.marker, "interruption-marker")
+
+    def test_interruption_prefix_requires_separator(self):
+        text = "Safe\nassistantmid-stream interruption is a discussed token"
+        self.assertEqual(split_fake_user_tail(text), (text, None))
 
     def test_discussion_in_prose_is_not_cut(self):
         text = (
@@ -70,6 +93,43 @@ class AttributionDetectorTests(unittest.TestCase):
         bad = find_false_attributions(
             'If the user just asked “is it deployed?”, I would answer yes.',
             ["unrelated"],
+        )
+        self.assertEqual(bad, [])
+
+    def test_unrelated_conditional_clause_does_not_hide_claim(self):
+        bad = find_false_attributions(
+            'If deployment is slow, retry; the user just said “ship it”.',
+            ["not yet"],
+        )
+        self.assertEqual(bad, ["ship it"])
+
+    def test_earlier_speech_verb_does_not_hide_claim(self):
+        bad = find_false_attributions(
+            'I asked for logs earlier; the user just said “ship it”.',
+            ["not yet"],
+        )
+        self.assertEqual(bad, ["ship it"])
+
+    def test_chinese_substrings_do_not_form_attribution(self):
+        bad = find_false_attributions(
+            "其他日志刚才由开发系统记录“内部值”。",
+            ["无关内容"],
+        )
+        self.assertEqual(bad, [])
+
+    def test_chinese_direct_attribution_is_detected(self):
+        for text in (
+            "她刚才问“修好了吗”。",
+            "上一条她发了“修好了吗”。",
+        ):
+            with self.subTest(text=text):
+                bad = find_false_attributions(text, ["还在检查"])
+                self.assertEqual(bad, ["修好了吗"])
+
+    def test_chinese_compound_verb_is_not_speech(self):
+        bad = find_false_attributions(
+            "用户刚才开发“内部值”。",
+            ["无关内容"],
         )
         self.assertEqual(bad, [])
 
