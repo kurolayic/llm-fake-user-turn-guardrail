@@ -8,7 +8,8 @@ It uses two layers:
 
 1. **Output boundary filter** — checks a bounded visible-text tail outside
    fenced code, then cuts it when a fake role, prefixed timestamp, or protocol
-   marker appears at the start of a line.
+   marker appears at the start of a line. The host must call this filter before
+   rendering or persisting assistant output.
 2. **Next-turn correction hook** — checks explicit quoted claims such as
    “the user just said ‘X’” against real user messages that occurred before the
    assistant event. If no matching user text exists, it injects corrective
@@ -76,12 +77,21 @@ The same snippet is available as
 The hook reads Claude Code's JSON payload from stdin, reads only the tail of
 the referenced local transcript, and writes hook JSON to stdout only when a
 finding exists. It performs no network requests and does not modify the
-transcript. Detected model text is never copied into `additionalContext`; the
-hook injects only finding type, count, and line metadata.
+transcript. Assistant events separated by tool-result events are aggregated as
+one logical turn. Detected model text is never copied into
+`additionalContext`; the hook injects only finding type, count, quoted-
+attribution ordinal, and line metadata.
+
+If the configured transcript tail begins after the preceding real user prompt,
+semantic correction is conservatively skipped because the evidence window is
+incomplete. Structural boundary detection still runs. This avoids treating a
+real quote as fabricated merely because a large tool result pushed its source
+outside the byte window.
 
 The hook is necessarily a **next-turn** defense: it runs when the real user
 sends another prompt. To protect a chat UI in the same turn, call the output
-filter before rendering assistant text.
+filter before rendering assistant text. Installing only the example
+`UserPromptSubmit` hook does **not** activate same-turn output filtering.
 
 ## Output filter
 
@@ -108,8 +118,10 @@ output may contain sensitive conversation data.
 
 To keep false positives bounded, the default structural scan covers only the
 last 40 lines and 4,000 characters, skips Markdown fenced code, and does not
-treat an unprefixed timestamp as sufficient evidence by itself. A preceding
-role marker or a damaged prefix such as `univers[...]` still triggers it.
+treat an unprefixed timestamp as sufficient evidence by itself. Exact role
+lines such as `user`, `user:`, `assistant`, and `assistant:` trigger it. A
+preceding role marker or a damaged prefix such as `univers[...]` also triggers
+timestamp detection.
 
 ## Configuration
 
@@ -130,8 +142,9 @@ normalization applied to quoted claims and prior user text.
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers structural truncation, false-positive boundaries, real-user
-filtering, post-hoc denial washout, reasoning blocks, and hook output.
+The suite covers structural truncation, false-positive boundaries, multi-event
+assistant turns, incomplete transcript windows, real-user filtering, post-hoc
+denial washout, reasoning blocks, and hook output.
 
 ## Limits
 
@@ -146,8 +159,12 @@ filtering, post-hoc denial washout, reasoning blocks, and hook output.
   visible before the next-turn hook runs.
 - If a platform does not expose reasoning, only visible assistant text can be
   checked.
+- Same-turn filtering requires an integration point before the host renders or
+  persists model output; a prompt-submission hook alone cannot provide it.
 - Fully tag-wrapped user-shaped events are treated as injected context rather
   than proof of literal user speech.
+- This library does not retain dropped model text. If an application needs an
+  audit trail, the host must write a permission-restricted, rotating log.
 - Deterministic rules reduce risk; they do not prove that every remaining claim
   is true.
 
