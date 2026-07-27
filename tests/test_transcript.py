@@ -3,7 +3,12 @@ import pathlib
 import tempfile
 import unittest
 
-from fake_user_turn_guardrail.transcript import analyze_events, is_real_user_event, load_tail_events
+from fake_user_turn_guardrail.transcript import (
+    analyze_events,
+    is_real_user_event,
+    load_tail_events,
+    load_transcript_tail,
+)
 
 
 def user(text):
@@ -21,6 +26,24 @@ class TranscriptTests(unittest.TestCase):
             assistant({"type": "thinking", "thinking": 'The user just asked “is it fixed?”'}),
         ])
         self.assertEqual(analysis.false_attributions, ("is it fixed?",))
+
+    def test_split_assistant_turn_is_analyzed_as_one_turn(self):
+        analysis = analyze_events([
+            user("Please inspect the service."),
+            assistant({"type": "thinking", "thinking": 'The user just asked “is it fixed?”'}),
+            {
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "content": "service healthy",
+                }]},
+            },
+            assistant({"type": "text", "text": "The service is healthy."}),
+            user("Anything else?"),
+        ])
+        self.assertEqual(analysis.false_attributions, ("is it fixed?",))
+        self.assertEqual(analysis.false_attribution_lines, (1,))
+        self.assertEqual(analysis.false_attribution_numbers, (1,))
 
     def test_tool_result_cannot_prove_user_said_quote(self):
         events = [
@@ -88,6 +111,32 @@ class TranscriptTests(unittest.TestCase):
             loaded = load_tail_events(path, tail_bytes=100)
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0]["type"], "assistant")
+
+    def test_incomplete_tail_without_turn_prompt_suppresses_semantic_finding(self):
+        events = [
+            assistant({"type": "text", "text": 'The user just asked “is it fixed?”'}),
+            user("continue"),
+        ]
+        analysis = analyze_events(events, history_complete=False)
+        self.assertEqual(analysis.false_attributions, ())
+
+    def test_incomplete_tail_with_turn_prompt_can_check_semantics(self):
+        events = [
+            user("Please inspect the service."),
+            assistant({"type": "text", "text": 'The user just asked “is it fixed?”'}),
+            user("continue"),
+        ]
+        analysis = analyze_events(events, history_complete=False)
+        self.assertEqual(analysis.false_attributions, ("is it fixed?",))
+
+    def test_tail_loader_reports_incomplete_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "session.jsonl"
+            rows = [user("x" * 200), assistant({"type": "text", "text": "answer"})]
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            loaded = load_transcript_tail(path, tail_bytes=100)
+            self.assertFalse(loaded.history_complete)
+            self.assertEqual([event["type"] for event in loaded.events], ["assistant"])
 
 
 if __name__ == "__main__":

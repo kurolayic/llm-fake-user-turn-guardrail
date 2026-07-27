@@ -7,7 +7,15 @@ import re
 from typing import Iterable
 
 
-ROLE_MARKERS = frozenset({"user", "assistant", "human:", "h:", "a:"})
+ROLE_MARKERS = frozenset({
+    "user",
+    "user:",
+    "assistant",
+    "assistant:",
+    "human:",
+    "h:",
+    "a:",
+})
 FAKE_USER_TIMESTAMP = re.compile(
     r"^(?:(?P<prefix>user|univers(?:e)?)\s*)?"
     r"\[20\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]",
@@ -62,6 +70,15 @@ class AttributionConfig:
     )
     lookback_chars: int = 140
     max_quote_chars: int = 120
+
+
+@dataclass(frozen=True)
+class AttributionFinding:
+    """One false quoted attribution and its safe location metadata."""
+
+    quote: str
+    line_number: int
+    attribution_number: int
 
 
 def normalize_whitespace(text: str) -> str:
@@ -258,6 +275,38 @@ def _is_hypothetical(prefix: str) -> bool:
     return _first_position(folded, HYPOTHETICAL_TERMS) is not None
 
 
+def find_false_attribution_findings(
+    assistant_text: str,
+    prior_real_user_texts: Iterable[str],
+    config: AttributionConfig | None = None,
+) -> list[AttributionFinding]:
+    """Return false quoted claims with line and attribution ordinals."""
+
+    config = config or AttributionConfig()
+    prior = [normalize_whitespace(text) for text in prior_real_user_texts]
+    findings: list[AttributionFinding] = []
+    attribution_number = 0
+    seen_quotes: set[str] = set()
+    for start, quote in _quoted_spans(assistant_text, config.max_quote_chars):
+        prefix = assistant_text[max(0, start - config.lookback_chars):start]
+        if not _is_explicit_near_attribution(prefix, config):
+            continue
+        if _is_hypothetical(prefix):
+            continue
+        attribution_number += 1
+        normalized_quote = normalize_whitespace(quote)
+        if any(normalized_quote and normalized_quote in user_text for user_text in prior):
+            continue
+        if quote and quote not in seen_quotes:
+            seen_quotes.add(quote)
+            findings.append(AttributionFinding(
+                quote=quote,
+                line_number=assistant_text.count("\n", 0, start) + 1,
+                attribution_number=attribution_number,
+            ))
+    return findings
+
+
 def find_false_attributions(
     assistant_text: str,
     prior_real_user_texts: Iterable[str],
@@ -265,18 +314,11 @@ def find_false_attributions(
 ) -> list[str]:
     """Return explicit quoted claims not found in prior real user messages."""
 
-    config = config or AttributionConfig()
-    prior = [normalize_whitespace(text) for text in prior_real_user_texts]
-    findings: list[str] = []
-    for start, quote in _quoted_spans(assistant_text, config.max_quote_chars):
-        prefix = assistant_text[max(0, start - config.lookback_chars):start]
-        if not _is_explicit_near_attribution(prefix, config):
-            continue
-        if _is_hypothetical(prefix):
-            continue
-        normalized_quote = normalize_whitespace(quote)
-        if any(normalized_quote and normalized_quote in user_text for user_text in prior):
-            continue
-        if quote and quote not in findings:
-            findings.append(quote)
-    return findings
+    return [
+        finding.quote
+        for finding in find_false_attribution_findings(
+            assistant_text,
+            prior_real_user_texts,
+            config,
+        )
+    ]

@@ -13,6 +13,13 @@ class StructuralDetectorTests(unittest.TestCase):
         self.assertEqual(safe, "Done.")
         self.assertEqual(finding.marker, "role-marker")
 
+    def test_colon_role_markers_cut_tail(self):
+        for marker in ("user:", "assistant:"):
+            with self.subTest(marker=marker):
+                safe, finding = split_fake_user_tail(f"Done.\n{marker}\nfabricated")
+                self.assertEqual(safe, "Done.")
+                self.assertEqual(finding.marker, "role-marker")
+
     def test_timestamp_and_corrupted_user_prefix_cut_tail(self):
         for prefix in ("user", "univers", "universe"):
             with self.subTest(prefix=prefix):

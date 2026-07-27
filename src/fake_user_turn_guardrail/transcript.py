@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from .detector import (
     AttributionConfig,
     StructuralFinding,
-    find_false_attributions,
+    find_false_attribution_findings,
     split_fake_user_tail,
 )
 
@@ -36,10 +36,20 @@ SELF_CLOSING_TAG = re.compile(
 class Analysis:
     structural: StructuralFinding | None
     false_attributions: tuple[str, ...]
+    false_attribution_lines: tuple[int, ...] = ()
+    false_attribution_numbers: tuple[int, ...] = ()
 
     @property
     def found(self) -> bool:
         return self.structural is not None or bool(self.false_attributions)
+
+
+@dataclass(frozen=True)
+class LoadedTranscriptTail:
+    """Parsed tail events and whether the full earlier history was available."""
+
+    events: tuple[dict[str, Any], ...]
+    history_complete: bool
 
 
 def _assistant_parts(event: dict[str, Any], *, include_thinking: bool) -> list[str]:
@@ -119,17 +129,18 @@ def is_real_user_event(event: dict[str, Any]) -> bool:
     return True
 
 
-def load_tail_events(
+def load_transcript_tail(
     path: str | Path,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
-) -> list[dict[str, Any]]:
+) -> LoadedTranscriptTail:
     transcript = Path(path)
     if not transcript.is_file():
-        return []
+        return LoadedTranscriptTail((), True)
     with transcript.open("rb") as handle:
         handle.seek(0, 2)
         size = handle.tell()
-        handle.seek(max(0, size - tail_bytes))
+        offset = max(0, size - tail_bytes)
+        handle.seek(offset)
         tail = handle.read().decode("utf-8", errors="replace")
     events: list[dict[str, Any]] = []
     for line in tail.splitlines():
@@ -139,12 +150,23 @@ def load_tail_events(
             continue
         if isinstance(event, dict):
             events.append(event)
-    return events
+    return LoadedTranscriptTail(tuple(events), history_complete=offset == 0)
+
+
+def load_tail_events(
+    path: str | Path,
+    tail_bytes: int = DEFAULT_TAIL_BYTES,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning only parsed transcript events."""
+
+    return list(load_transcript_tail(path, tail_bytes).events)
 
 
 def analyze_events(
     events: Iterable[dict[str, Any]],
     config: AttributionConfig | None = None,
+    *,
+    history_complete: bool = True,
 ) -> Analysis:
     event_list = list(events)
     last_assistant = -1
@@ -154,14 +176,45 @@ def analyze_events(
     if last_assistant < 0:
         return Analysis(None, ())
 
-    assistant_event = event_list[last_assistant]
-    visible_text = assistant_visible_text(assistant_event)
-    body = assistant_body(assistant_event)
+    turn_start = 0
+    for index in range(last_assistant - 1, -1, -1):
+        if is_real_user_event(event_list[index]):
+            turn_start = index + 1
+            break
+
+    assistant_events = [
+        event
+        for event in event_list[turn_start:last_assistant + 1]
+        if assistant_body(event).strip()
+    ]
+    visible_text = "\n".join(
+        text
+        for event in assistant_events
+        if (text := assistant_visible_text(event)).strip()
+    )
+    body = "\n".join(
+        text
+        for event in assistant_events
+        if (text := assistant_body(event)).strip()
+    )
     _, structural = split_fake_user_tail(visible_text)
     prior_real_users = [
         user_text(event)
-        for event in event_list[:last_assistant]
+        for event in event_list[:turn_start]
         if is_real_user_event(event)
     ]
-    false_attributions = find_false_attributions(body, prior_real_users, config)
-    return Analysis(structural, tuple(false_attributions))
+    has_turn_prompt = (
+        turn_start > 0
+        and is_real_user_event(event_list[turn_start - 1])
+    )
+    attribution_findings = (
+        find_false_attribution_findings(body, prior_real_users, config)
+        if history_complete or has_turn_prompt
+        else []
+    )
+    return Analysis(
+        structural,
+        tuple(finding.quote for finding in attribution_findings),
+        tuple(finding.line_number for finding in attribution_findings),
+        tuple(finding.attribution_number for finding in attribution_findings),
+    )
