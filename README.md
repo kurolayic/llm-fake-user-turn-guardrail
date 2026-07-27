@@ -6,8 +6,9 @@ conversation history on the next turn.
 
 It uses two layers:
 
-1. **Output boundary filter** — cuts visible assistant text when a fake role,
-   timestamp, or protocol marker appears at the start of a line.
+1. **Output boundary filter** — checks a bounded visible-text tail outside
+   fenced code, then cuts it when a fake role, prefixed timestamp, or protocol
+   marker appears at the start of a line.
 2. **Next-turn correction hook** — checks explicit quoted claims such as
    “the user just said ‘X’” against real user messages that occurred before the
    assistant event. If no matching user text exists, it injects corrective
@@ -75,7 +76,8 @@ The same snippet is available as
 The hook reads Claude Code's JSON payload from stdin, reads only the tail of
 the referenced local transcript, and writes hook JSON to stdout only when a
 finding exists. It performs no network requests and does not modify the
-transcript.
+transcript. Detected model text is never copied into `additionalContext`; the
+hook injects only finding type, count, and line metadata.
 
 The hook is necessarily a **next-turn** defense: it runs when the real user
 sends another prompt. To protect a chat UI in the same turn, call the output
@@ -104,6 +106,11 @@ The filter does not write an audit log itself. Applications should keep any
 dropped text in a permission-restricted, rotating local log because model
 output may contain sensitive conversation data.
 
+To keep false positives bounded, the default structural scan covers only the
+last 40 lines and 4,000 characters, skips Markdown fenced code, and does not
+treat an unprefixed timestamp as sufficient evidence by itself. A preceding
+role marker or a damaged prefix such as `univers[...]` still triggers it.
+
 ## Configuration
 
 The semantic detector uses conservative English and Chinese defaults. Override
@@ -129,12 +136,18 @@ filtering, post-hoc denial washout, reasoning blocks, and hook output.
 ## Limits
 
 - Structural filtering catches only recognizable boundary artifacts.
+- Structural markers outside the bounded tail are intentionally ignored.
+- A bare timestamp without a nearby role boundary is treated as ordinary log
+  output; applications with a stronger transcript protocol can add their own
+  rule.
 - Semantic detection intentionally ignores unquoted paraphrases and distant
   memories such as “the user said this last month.”
 - The first response produced from a reasoning hallucination may already be
   visible before the next-turn hook runs.
 - If a platform does not expose reasoning, only visible assistant text can be
   checked.
+- Fully tag-wrapped user-shaped events are treated as injected context rather
+  than proof of literal user speech.
 - Deterministic rules reduce risk; they do not prove that every remaining claim
   is true.
 
